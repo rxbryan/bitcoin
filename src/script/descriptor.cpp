@@ -174,6 +174,24 @@ std::string AddChecksum(const std::string& str) { return str + "#" + DescriptorC
 
 typedef std::vector<uint32_t> KeyPath;
 
+struct MultipathContext {
+    struct KeyEntry {
+        // @N placeholder for this particular key.
+        size_t placeholder_idx;
+        // Receive and change indexes (path expressions) for this key.
+        // Per BIP 388 all identical placeholders must have disjoint path expressions.
+        // e.g.  If two KEY are KP/<M;N>/* and KP/<P;Q>/* for the same key placeholder KP, then the sets {M, N} and {P, Q} must be disjoint.
+        std::unordered_set<uint32_t> claimed_mn;
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> per_key_mn;
+    // Mutable because ToTemplateString is called through const providers but must write to context.
+    // aggregate_claimed_mn: Receive and change indexes (path expressions) for this key.
+    mutable std::map<std::string, std::unordered_set<uint32_t>> aggregate_claimed_mn;
+    mutable std::map<std::string, KeyEntry> key_map;
+    bool IsMultipath() const { return !per_key_mn.empty(); }
+};
+
 /** Interface for public key objects in descriptors. */
 struct PubkeyProvider
 {
@@ -247,6 +265,21 @@ public:
 
     /** Get the count of keys known by this PubkeyProvider. Usually one, but may be more for key aggregation schemes */
     virtual size_t GetKeyCount() const { return 1; }
+
+    /** Return the BIP-388 wallet policy placeholder for this key, or {} on failure. */
+    virtual std::string ToTemplateString(size_t& placeholder_idx, size_t& traversal_idx, const MultipathContext& ctx = {}) const
+    {
+        const std::string ret{"@" + util::ToString(placeholder_idx)};
+        ++placeholder_idx;
+        ++traversal_idx;
+        return ret;
+    }
+
+    /** Append the last non-hardened derivation index for each @N. */
+    virtual void GetDerivationIndex(std::vector<uint32_t>& out) const {}
+
+    /** Append the BIP32 origin and account-level xpub for each key. */
+    virtual void GetKeyOrigins(std::vector<std::pair<KeyOriginInfo, CExtPubKey>>& out) const {}
 };
 
 class OriginPubkeyProvider final : public PubkeyProvider
@@ -317,6 +350,30 @@ public:
     {
         return std::make_unique<OriginPubkeyProvider>(m_expr_index, m_origin, m_provider->Clone(), m_apostrophe);
     }
+
+    std::string ToTemplateString(size_t& placeholder_idx, size_t& traversal_idx, const MultipathContext& ctx) const override
+    {
+        return m_provider->ToTemplateString(placeholder_idx, traversal_idx, ctx);
+    }
+
+    void GetDerivationIndex(std::vector<uint32_t>& out) const override
+    {
+        m_provider->GetDerivationIndex(out);
+    }
+
+    void GetKeyOrigins(std::vector<std::pair<KeyOriginInfo, CExtPubKey>>& out) const override
+    {
+        if (m_provider->IsBIP32()) {
+            std::optional<CExtPubKey> root = m_provider->GetRootExtPubKey();
+            if (root) {
+                out.emplace_back(m_origin, *root);
+                return;
+            }
+        }
+        // For musig, delegate so each participant emits its own origin.
+        m_provider->GetKeyOrigins(out);
+    }
+
 };
 
 /** An object representing a parsed constant public key in a descriptor. */
@@ -607,6 +664,47 @@ public:
     {
         return std::make_unique<BIP32PubkeyProvider>(m_expr_index, m_root_extkey, m_path, m_derive, m_apostrophe);
     }
+    void GetDerivationIndex(std::vector<uint32_t>& out) const override
+    {
+        if (!m_path.empty() && m_derive == DeriveType::UNHARDENED_RANGED) {
+            out.push_back(m_path.back());
+        }
+    }
+    std::string ToTemplateString(size_t& placeholder_idx, size_t& traversal_idx, const MultipathContext& ctx) const override
+    {
+        const size_t t_idx{traversal_idx++};
+
+        if (!ctx.IsMultipath() || t_idx >= ctx.per_key_mn.size() || !IsRange()) {
+            const std::string ret{"@" + util::ToString(placeholder_idx)};
+            ++placeholder_idx;
+            return ret;
+        }
+
+        // BIP 388 requires exactly one unhardened derivation step after the account xpub.
+        if (m_path.size() != 1 || m_derive != DeriveType::UNHARDENED_RANGED) {
+            return {};
+        }
+
+        const auto [M, N] = ctx.per_key_mn[t_idx];
+        const std::string suffix{(M == 0 && N == 1)
+            ? "/**"
+            : "/<" + util::ToString(M) + ";" + util::ToString(N) + ">/*"};
+
+        const std::string xpub_str{EncodeExtPubKey(m_root_extkey)};
+        auto it{ctx.key_map.find(xpub_str)};
+        if (it != ctx.key_map.end()) {
+            auto& entry{it->second};
+            if (entry.claimed_mn.contains(M) || entry.claimed_mn.contains(N)) return {};
+            entry.claimed_mn.insert(M);
+            entry.claimed_mn.insert(N);
+            return "@" + util::ToString(entry.placeholder_idx) + suffix;
+        }
+
+        ctx.key_map[xpub_str] = {placeholder_idx, {M, N}};
+        const std::string placeholder{"@" + util::ToString(placeholder_idx)};
+        ++placeholder_idx;
+        return placeholder + suffix;
+    }
 };
 
 /** PubkeyProvider for a musig() expression */
@@ -809,6 +907,87 @@ public:
     size_t GetKeyCount() const override
     {
         return 1 + m_participants.size();
+    }
+    std::string ToTemplateString(size_t& placeholder_idx, size_t& traversal_idx, const MultipathContext& ctx) const override
+    {
+        // BIP-388 disallows derivation before aggregation:
+        //   VALID:   tr(musig(@0,@1)/<0;1>/*,...)
+        //   INVALID: tr(musig(@0/<0;1>/*,@1/<0;1>/*),...)
+        if (m_ranged_participants) return {};
+
+        const size_t first_t_idx{traversal_idx};
+        // We also want to know if multiple musig expressions in a descriptor are duplicate,
+        // if so are they disjoint?
+        std::vector<std::string> sorted_xpubs;
+        sorted_xpubs.reserve(m_participants.size());
+
+        std::string ret{"musig("};
+
+        for (size_t i{0}; i < m_participants.size(); ++i) {
+            const auto xpub{m_participants[i]->GetRootExtPubKey()};
+            if (!xpub) return {};
+
+            const std::string xpub_str{EncodeExtPubKey(*xpub)};
+            sorted_xpubs.push_back(xpub_str);
+
+            auto it{ctx.key_map.find(xpub_str)};
+
+            if (it != ctx.key_map.end()) {
+                // We have seen this participant before so reuse existing placeholder.
+                // Musig participants are arguments to the aggregate, so BIP-388 disjointness does not apply to individual participants.
+                ret += "@" + util::ToString(it->second.placeholder_idx);
+            } else {
+                ctx.key_map[xpub_str] = {placeholder_idx, {}};
+                ret += "@" + util::ToString(placeholder_idx);
+                ++placeholder_idx;
+            }
+            ++traversal_idx;
+
+            if (i < m_participants.size() - 1) ret += ',';
+        }
+        ret += ')';
+
+        std::sort(sorted_xpubs.begin(), sorted_xpubs.end());
+        const std::string aggregate_id{util::Join(sorted_xpubs, ",")};
+
+        // BIP 388 requires exactly one unhardened derivation step after the account xpub.
+        if (ctx.IsMultipath() && m_path.size() == 1
+                && m_derive == DeriveType::UNHARDENED_RANGED
+                && first_t_idx + m_participants.size() <= ctx.per_key_mn.size()) {
+            const auto [M, N] = ctx.per_key_mn[first_t_idx];
+
+            // Check if the representation of the aggregate key, same set of participants, order independent exists.
+            // If so, we enforce disjointness.
+            auto& claimed = ctx.aggregate_claimed_mn[aggregate_id];
+            if (claimed.contains(M) || claimed.contains(N)) return {};
+            claimed.insert(M);
+            claimed.insert(N);
+
+            const std::string suffix{(M == 0 && N == 1)
+                ? "/**"
+                : "/<" + util::ToString(M) + ";" + util::ToString(N) + ">/*"};
+            ret += suffix;
+        } else {
+            ret += FormatHDKeypath(m_path, /*apostrophe=*/false);
+            if (IsRangedDerivation()) ret += "/*";
+        }
+
+        return ret;
+    }
+    void GetDerivationIndex(std::vector<uint32_t>& out) const override
+    {
+        if (IsRangedDerivation() && !m_path.empty()
+                && m_derive == DeriveType::UNHARDENED_RANGED) {
+            for (size_t i{0}; i < m_participants.size(); ++i) {
+                out.push_back(m_path.back());
+            }
+        }
+    }
+    void GetKeyOrigins(std::vector<std::pair<KeyOriginInfo, CExtPubKey>>& out) const override
+    {
+        for (const auto& p : m_participants) {
+            p->GetKeyOrigins(out);
+        }
     }
 };
 
@@ -1098,6 +1277,24 @@ public:
             }
         }
         return count;
+    }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    void GetDerivationIndex(std::vector<uint32_t>& out) const
+    {
+        for (const auto& p : m_pubkey_args) p->GetDerivationIndex(out);
+        for (const auto& s : m_subdescriptor_args) s->GetDerivationIndex(out);
+    }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    void GetKeyOrigins(std::vector<std::pair<KeyOriginInfo, CExtPubKey>>& out) const
+    {
+        for (const auto& p : m_pubkey_args) {
+            p->GetKeyOrigins(out);
+        }
+        for (const auto& arg : m_subdescriptor_args) {
+            arg->GetKeyOrigins(out);
+        }
     }
 };
 
