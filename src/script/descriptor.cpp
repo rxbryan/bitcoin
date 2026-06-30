@@ -29,6 +29,7 @@
 #include <util/check.h>
 #include <util/strencodings.h>
 #include <util/string.h>
+#include <util/translation.h>
 #include <util/vector.h>
 
 #include <algorithm>
@@ -1155,9 +1156,7 @@ public:
                 }
             }
 
-            for (const auto& k : keys) {
-                if (k.empty()) return std::nullopt;
-            }
+            if (std::ranges::any_of(keys, [](const auto& k) { return k.empty(); })) return std::nullopt;
             policy.keys = std::move(keys);
             return policy;
         }
@@ -3324,6 +3323,58 @@ std::string GetDescriptorChecksum(const std::string& descriptor)
     std::span<const char> sp{descriptor};
     if (!CheckChecksum(sp, false, error, &ret)) return "";
     return ret;
+}
+
+util::Result<DescriptorInfo> ParseDescriptorInfo(std::string_view descriptor)
+{
+    FlatSigningProvider provider;
+    std::string error;
+    auto descs = Parse(descriptor, provider, error);
+    if (descs.empty()) return util::Error{Untranslated(error)};
+
+    DescriptorInfo info;
+    info.descriptor = descs.at(0)->ToString();
+
+    if (descs.size() > 1) {
+        info.expansion.reserve(descs.size());
+        for (const auto& d : descs) {
+            info.expansion.push_back(d->ToString());
+        }
+    }
+
+    info.checksum = GetDescriptorChecksum(std::string{descriptor});
+    info.is_range = descs.at(0)->IsRange();
+    info.is_solvable = descs.at(0)->IsSolvable();
+    info.has_private_keys = !provider.keys.empty();
+
+    if (descs.size() == 2) {
+        const auto* desc_m{static_cast<const DescriptorImpl*>(descs[0].get())};
+        const auto* desc_n{static_cast<const DescriptorImpl*>(descs[1].get())};
+        Assert(desc_m && desc_n);
+
+        std::vector<uint32_t> m_idx, n_idx;
+        desc_m->GetDerivationIndex(m_idx);
+        desc_n->GetDerivationIndex(n_idx);
+
+        if (m_idx.size() == n_idx.size() && !m_idx.empty()) {
+            MultipathContext ctx;
+            bool valid{true};
+
+            for (size_t i{0}; i < m_idx.size(); ++i) {
+                const uint32_t M{m_idx[i]}, N{n_idx[i]};
+                if (M == N) {
+                    valid = false;
+                    break;
+                }
+                ctx.per_key_mn.emplace_back(M, N);
+            }
+            if (valid) {
+                info.wallet_policy = desc_m->BuildWalletPolicy(ctx);
+            }
+        }
+    }
+
+    return info;
 }
 
 std::unique_ptr<Descriptor> InferDescriptor(const CScript& script, const SigningProvider& provider)

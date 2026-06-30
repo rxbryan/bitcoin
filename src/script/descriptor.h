@@ -253,6 +253,33 @@ std::vector<std::unique_ptr<Descriptor>> Parse(std::string_view descriptor, Flat
  */
 std::string GetDescriptorChecksum(const std::string& descriptor);
 
+/** Structured result from ParseDescriptorInfo.
+ */
+struct DescriptorInfo {
+    /** Descriptor string without private keys.*/
+    std::string descriptor;
+
+    /* Empty if descriptor is not multipath */
+    std::vector<std::string> expansion;
+
+    std::string checksum;
+
+    bool is_range{false};
+
+    bool is_solvable{false};
+
+    bool has_private_keys{false};
+
+    /** nullopt if the descriptor is not BIP-388 policy-compatible. */
+    std::optional<WalletPolicy> wallet_policy;
+};
+
+/** Parse a descriptor string into a DescriptorInfo Object
+ *
+ * @param[in] descriptor  Descriptor string, with or without checksum
+ */
+util::Result<DescriptorInfo> ParseDescriptorInfo(std::string_view descriptor);
+
 /** Find a descriptor for the specified `script`, using information from `provider` where possible.
  *
  * A non-ranged descriptor which only generates the specified script will be returned in all
