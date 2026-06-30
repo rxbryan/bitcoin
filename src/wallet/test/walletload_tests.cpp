@@ -10,6 +10,8 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <string>
+
 namespace wallet {
 
 BOOST_AUTO_TEST_SUITE(walletload_tests)
@@ -41,6 +43,8 @@ public:
     std::vector<std::string> Warnings() const override { return {}; }
     uint32_t GetMaxKeyExpr() const override { return 0; }
     size_t GetKeyCount() const override { return 0; }
+    void GetDerivationIndex(std::vector<uint32_t>& out) const override {}
+    std::optional<WalletPolicy> BuildWalletPolicy(const MultipathContext& ctx = {}) const override { return std::nullopt; }
 };
 
 BOOST_FIXTURE_TEST_CASE(wallet_load_descriptors, TestingSetup)
