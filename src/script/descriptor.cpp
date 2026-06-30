@@ -2054,6 +2054,47 @@ public:
         }
         return std::make_unique<MiniscriptDescriptor>(std::move(providers), m_node.Clone());
     }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    bool BuildWalletPolicyTemplate(std::string& out, size_t& placeholder_idx, size_t& traversal_idx, const MultipathContext& ctx = {}) const override
+    {
+        // Mirrors StringMaker's interface for m_node.ToString
+        struct TemplateStringifier {
+            const std::vector<std::unique_ptr<PubkeyProvider>>& pubkeys;
+            size_t& placeholder_idx;
+            size_t& traversal_idx;
+            const MultipathContext& ctx;
+            mutable std::map<uint32_t, std::string> cache;
+
+            std::optional<std::string> ToString(uint32_t key, [[maybe_unused]] bool& has_priv_key) const
+            {
+                if (key >= pubkeys.size()) return std::nullopt;
+                // toString is called twice when WRAP_C contains pk(k) and pkh(k).
+                // So we end up having more keys in ctx.key_map than in the descriptor.
+                // since the double call reuses the same key index, we cache the result and
+                // return it on repeat calls to avoid double-incrementing
+                // traversal_idx and triggering the claimed_mn disjointness check.
+                auto it{cache.find(key)};
+                if (it != cache.end()) return it->second;
+                std::string ret{pubkeys[key]->ToTemplateString(
+                    placeholder_idx, traversal_idx, ctx)};
+                if (ret.empty()) return std::nullopt;
+                cache[key] = ret;
+                return ret;
+            }
+        };
+
+        bool has_priv_key{false};
+        auto res = m_node.ToString(TemplateStringifier{m_pubkey_args, placeholder_idx, traversal_idx, ctx, {}}, has_priv_key);
+        if (!res) return false;
+        out = *res;
+        return true;
+    }
+
+    std::optional<WalletPolicy> BuildWalletPolicy(const MultipathContext& ctx) const override
+    {
+        return DoBuildWalletPolicy(ctx);
+    }
 };
 
 /** A parsed rawtr(...) descriptor. */
