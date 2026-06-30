@@ -1396,4 +1396,95 @@ BOOST_AUTO_TEST_CASE(unused_descriptor_test)
     CheckUnused("unused(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/0h/0h/1)", "unused(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/0h/0h/1)");
 }
 
+static std::optional<WalletPolicy> TestBuildWalletPolicy(const std::string& descriptor)
+{
+    FlatSigningProvider provider;
+    std::string error;
+    auto descs = Parse(descriptor, provider, error);
+    if (descs.size() != 2) return std::nullopt;
+
+    std::vector<uint32_t> m_idx, n_idx;
+    descs[0]->GetDerivationIndex(m_idx);
+    descs[1]->GetDerivationIndex(n_idx);
+
+    if (m_idx.size() != n_idx.size() || m_idx.empty()) return std::nullopt;
+
+    MultipathContext ctx;
+    for (size_t i{0}; i < m_idx.size(); ++i) {
+        if (m_idx[i] == n_idx[i]) return std::nullopt;
+        ctx.per_key_mn.emplace_back(m_idx[i], n_idx[i]);
+    }
+
+    return descs[0]->BuildWalletPolicy(ctx);
+}
+
+static void CheckWalletPolicy(const std::string& descriptor,
+    const std::string& expected_template,
+    const std::vector<std::string>& expected_keys)
+{
+    auto policy = TestBuildWalletPolicy(descriptor);
+    BOOST_REQUIRE_MESSAGE(policy.has_value(), "Expected wallet_policy for: " + descriptor);
+    BOOST_CHECK_EQUAL(policy->descriptor_template, expected_template);
+    BOOST_REQUIRE_EQUAL(policy->keys.size(), expected_keys.size());
+    for (size_t i{0}; i < expected_keys.size(); ++i) {
+        BOOST_CHECK_EQUAL(policy->keys.at(i), expected_keys.at(i));
+    }
+}
+
+static void CheckNoWalletPolicy(const std::string& descriptor)
+{
+    BOOST_CHECK_MESSAGE(!TestBuildWalletPolicy(descriptor).has_value(),
+        "Unexpected wallet_policy for: " + descriptor);
+}
+
+BOOST_AUTO_TEST_CASE(descriptor_wallet_policy)
+{
+    // Some happypaths for BIP 388
+    CheckWalletPolicy(
+        "pkh([6738736c/44h/0h/0h]xpub6Br37sWxruYfT8ASpCjVHKGwgdnYFEn98DwiN76i2oyY6fgH1LAPmmDcF46xjxJr22gw4jmVjTE2E3URMnRPEPYyo1zoPSUba563ESMXCeb/<0;1>/*)",
+        "pkh(@0/**)",
+        {"[6738736c/44h/0h/0h]xpub6Br37sWxruYfT8ASpCjVHKGwgdnYFEn98DwiN76i2oyY6fgH1LAPmmDcF46xjxJr22gw4jmVjTE2E3URMnRPEPYyo1zoPSUba563ESMXCeb"});
+
+    CheckWalletPolicy(
+        "wpkh([6738736c/84h/0h/2h]xpub6CRQzb8u9dmMcq5XAwwRn9gcoYCjndJkhKgD11WKzbVGd932UmrExWFxCAvRnDN3ez6ZujLmMvmLBaSWdfWVn75L83Qxu1qSX4fJNrJg2Gt/<0;1>/*)",
+        "wpkh(@0/**)",
+        {"[6738736c/84h/0h/2h]xpub6CRQzb8u9dmMcq5XAwwRn9gcoYCjndJkhKgD11WKzbVGd932UmrExWFxCAvRnDN3ez6ZujLmMvmLBaSWdfWVn75L83Qxu1qSX4fJNrJg2Gt"});
+
+    CheckWalletPolicy(
+        "sh(wpkh([6738736c/49h/0h/1h]xpub6Bex1CHWGXNNwGVKHLqNC7kcV348FxkCxpZXyCWp1k27kin8sRPayjZUKDjyQeZzGUdyeAj2emoW5zStFFUAHRgd5w8iVVbLgZ7PmjAKAm9/<0;1>/*))",
+        "sh(wpkh(@0/**))",
+        {"[6738736c/49h/0h/1h]xpub6Bex1CHWGXNNwGVKHLqNC7kcV348FxkCxpZXyCWp1k27kin8sRPayjZUKDjyQeZzGUdyeAj2emoW5zStFFUAHRgd5w8iVVbLgZ7PmjAKAm9"});
+
+    CheckWalletPolicy(
+        "wsh(sortedmulti(2,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<0;1>/*,[b2b1f0cf/48h/0h/0h/2h]xpub6EWhjpPa6FqrcaPBuGBZRJVjzGJ1ZsMygRF26RwN932Vfkn1gyCiTbECVitBjRCkexEvetLdiqzTcYimmzYxyR1BZ79KNevgt61PDcukmC7/<0;1>/*))",
+        "wsh(sortedmulti(2,@0/**,@1/**))",
+        {"[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw",
+         "[b2b1f0cf/48h/0h/0h/2h]xpub6EWhjpPa6FqrcaPBuGBZRJVjzGJ1ZsMygRF26RwN932Vfkn1gyCiTbECVitBjRCkexEvetLdiqzTcYimmzYxyR1BZ79KNevgt61PDcukmC7"});
+
+    CheckWalletPolicy(
+        "wsh(multi(2,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<0;1>/*,[b2b1f0cf/48h/0h/0h/2h]xpub6EWhjpPa6FqrcaPBuGBZRJVjzGJ1ZsMygRF26RwN932Vfkn1gyCiTbECVitBjRCkexEvetLdiqzTcYimmzYxyR1BZ79KNevgt61PDcukmC7/<0;1>/*))",
+        "wsh(multi(2,@0/**,@1/**))",
+        {"[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw",
+         "[b2b1f0cf/48h/0h/0h/2h]xpub6EWhjpPa6FqrcaPBuGBZRJVjzGJ1ZsMygRF26RwN932Vfkn1gyCiTbECVitBjRCkexEvetLdiqzTcYimmzYxyR1BZ79KNevgt61PDcukmC7"});
+
+    // Non supported script types (BIP 388)
+    CheckNoWalletPolicy("wpkh([deadbeef/1/2h/3/4h]03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd)");
+    CheckNoWalletPolicy("wpkh([6738736c/84h/0h/2h]xpub6CRQzb8u9dmMcq5XAwwRn9gcoYCjndJkhKgD11WKzbVGd932UmrExWFxCAvRnDN3ez6ZujLmMvmLBaSWdfWVn75L83Qxu1qSX4fJNrJg2Gt/0/*)");
+    CheckNoWalletPolicy("combo([6738736c/84h/0h/2h]xpub6CRQzb8u9dmMcq5XAwwRn9gcoYCjndJkhKgD11WKzbVGd932UmrExWFxCAvRnDN3ez6ZujLmMvmLBaSWdfWVn75L83Qxu1qSX4fJNrJg2Gt/<0;1>/*)");
+    CheckNoWalletPolicy("raw(76a9149a1c78a507689f6f54b847ad1cef1e614ee23f1e88ac)");
+    CheckNoWalletPolicy("wsh(multi(2,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<0;1>/*,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<1;2>/*))");
+    CheckNoWalletPolicy("pkh([6738736c/44h/0h/0h]xpub6Br37sWxruYfT8ASpCjVHKGwgdnYFEn98DwiN76i2oyY6fgH1LAPmmDcF46xjxJr22gw4jmVjTE2E3URMnRPEPYyo1zoPSUba563ESMXCeb)");
+    // Extra unhardened path before receive/change index
+    CheckNoWalletPolicy("pkh([6738736c/44h/0h/0h]xpub6Br37sWxruYfT8ASpCjVHKGwgdnYFEn98DwiN76i2oyY6fgH1LAPmmDcF46xjxJr22gw4jmVjTE2E3URMnRPEPYyo1zoPSUba563ESMXCeb/0/<0;1>/*)");
+    // repeated key with same path expression
+    CheckNoWalletPolicy("sh(multi(1,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<0;1>/*,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<0;1>/*))");
+    // Non-disjoint multipath
+    CheckNoWalletPolicy("wsh(multi(2,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<0;1>/*,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<1;2>/*))");
+    // Key without origin info
+    CheckNoWalletPolicy("sh(multi(1,[6738736c/48h/0h/0h/2h]xpub6FC1fXFP1GXLX5TKtcjHGT4q89SDRehkQLtbKJ2PzWcvbBHtyDsJPLtpLtkGqYNYZdVVAjRQ5kug9CsapegmmeRutpP7PW4u4wVF9JfkDhw/<0;1>/*,xpub6EWhjpPa6FqrcaPBuGBZRJVjzGJ1ZsMygRF26RwN932Vfkn1gyCiTbECVitBjRCkexEvetLdiqzTcYimmzYxyR1BZ79KNevgt61PDcukmC7/<0;1>/*))");
+    // Multipath cardinality > 2
+    CheckNoWalletPolicy("pkh([6738736c/44h/0h/0h]xpub6Br37sWxruYfT8ASpCjVHKGwgdnYFEn98DwiN76i2oyY6fgH1LAPmmDcF46xjxJr22gw4jmVjTE2E3URMnRPEPYyo1zoPSUba563ESMXCeb/<0;1;2>/*)");
+    // Derivation before aggregation in musig
+}
+
 BOOST_AUTO_TEST_SUITE_END()

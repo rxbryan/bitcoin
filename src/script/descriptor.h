@@ -8,15 +8,19 @@
 #include <outputtype.h>
 #include <pubkey.h>
 #include <uint256.h>
+#include <util/result.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 class CScript;
@@ -86,6 +90,32 @@ public:
      * Returns a cache containing the items from the other cache unknown to current cache
      */
     DescriptorCache MergeAndDiff(const DescriptorCache& other);
+};
+
+struct MultipathContext {
+    struct KeyEntry {
+        // @N placeholder for this particular key.
+        size_t placeholder_idx;
+        // Receive and change indexes (path expressions) for this key.
+        // Per BIP 388 all identical placeholders must have disjoint path expressions.
+        // e.g.  If two KEY are KP/<M;N>/* and KP/<P;Q>/* for the same key placeholder KP, then the sets {M, N} and {P, Q} must be disjoint.
+        std::unordered_set<uint32_t> claimed_mn;
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> per_key_mn;
+    // Mutable because ToTemplateString is called through const providers but must write to context.
+    // aggregate_claimed_mn: Receive and change indexes (path expressions) for this key.
+    mutable std::map<std::string, std::unordered_set<uint32_t>> aggregate_claimed_mn;
+    mutable std::map<std::string, KeyEntry> key_map;
+    bool IsMultipath() const { return !per_key_mn.empty(); }
+};
+
+
+/** BIP-388 wallet policy: template string and key information vector. */
+struct WalletPolicy {
+    /** Policy template with @N key placeholders. */
+    std::string descriptor_template;
+    std::vector<std::string> keys;
 };
 
 /** \brief Interface for parsed descriptor objects.
@@ -200,6 +230,9 @@ struct Descriptor {
 
     /** Get the number of key expressions in this descriptor. Used only for tests */
     virtual size_t GetKeyCount() const = 0;
+
+    virtual void GetDerivationIndex(std::vector<uint32_t>& out) const = 0;
+    virtual std::optional<WalletPolicy> BuildWalletPolicy(const MultipathContext& ctx = {}) const = 0;
 };
 
 /** Parse a `descriptor` string. Included private keys are put in `out`.
