@@ -1846,6 +1846,49 @@ public:
         std::transform(m_subdescriptor_args.begin(), m_subdescriptor_args.end(), std::back_inserter(subdescs), [](const std::unique_ptr<DescriptorImpl>& d) { return d->Clone(); });
         return std::make_unique<TRDescriptor>(m_pubkey_args.at(0)->Clone(), std::move(subdescs), m_depths);
     }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    std::optional<WalletPolicy> BuildWalletPolicy(const MultipathContext& ctx) const override
+    {
+        // BIP-388 requires key expressions to include a derivation path
+        // suffix (/** or /<M;N>/*). Non-ranged keys have no such suffix.
+        if (!m_pubkey_args.at(0)->IsRange()) return std::nullopt;
+
+        WalletPolicy policy;
+        size_t placeholder_idx{0};
+        size_t traversal_idx{0};
+
+        const std::string internal_key{m_pubkey_args.at(0)->ToTemplateString(placeholder_idx, traversal_idx, ctx)};
+        if (internal_key.empty()) return std::nullopt;
+        std::string ret{"tr(" + internal_key};
+
+        if (!m_subdescriptor_args.empty()) {
+            std::string scripts;
+            std::vector<bool> path;
+            for (size_t i{0}; i < m_depths.size(); ++i) {
+                if (i > 0) scripts += ',';
+                while (static_cast<int>(path.size()) <= m_depths[i]) {
+                    if (path.size()) scripts += '{';
+                    path.push_back(false);
+                }
+                std::string sub_out;
+                if (!m_subdescriptor_args[i]->BuildWalletPolicyTemplate(sub_out, placeholder_idx, traversal_idx, ctx)) {
+                    return std::nullopt;
+                }
+                scripts += sub_out;
+                while (!path.empty() && path.back()) {
+                    if (path.size() > 1) scripts += '}';
+                    path.pop_back();
+                }
+                if (!path.empty()) path.back() = true;
+            }
+            ret += ',' + scripts;
+        }
+        ret += ')';
+        policy.descriptor_template = std::move(ret);
+
+        return BuildWalletPolicyKeys(std::move(policy), placeholder_idx, ctx);
+    }
 };
 
 /* We instantiate Miniscript here with a simple integer as key type.
